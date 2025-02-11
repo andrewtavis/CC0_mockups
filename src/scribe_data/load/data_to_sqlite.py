@@ -19,6 +19,8 @@ from scribe_data.utils import (
     camel_to_snake,
     get_language_iso,
     list_all_languages,
+    language_metadata,
+    data_type_metadata,
 )
 
 
@@ -27,33 +29,10 @@ def data_to_sqlite(
     specific_tables: Optional[List[str]] = None,
     identifier_case: str = "camel",
 ) -> None:
-    PATH_TO_SCRIBE_DATA = Path(__file__).parent.parent
+    current_language_data = language_metadata
+    data_types = data_type_metadata
 
-    with (
-        open(
-            PATH_TO_SCRIBE_DATA / "resources" / "language_metadata.json",
-            encoding="utf-8",
-        ) as f_languages,
-        open(
-            PATH_TO_SCRIBE_DATA / "resources" / "data_type_metadata.json",
-            encoding="utf-8",
-        ) as f_data_types,
-    ):
-        current_language_data = json.load(f_languages)
-        data_types = json.load(f_data_types).keys()
-
-    # TODO: Switch to all languages.
     current_languages = list_all_languages(current_language_data)
-    current_languages = [
-        "english",
-        "french",
-        "german",
-        "italian",
-        "portuguese",
-        "russian",
-        "spanish",
-        "swedish",
-    ]
 
     if not languages:
         languages = current_languages
@@ -73,7 +52,9 @@ def data_to_sqlite(
     language_data_type_dict = {
         lang: [
             f.split(".json")[0]
-            for f in os.listdir(Path(DEFAULT_JSON_EXPORT_DIR) / lang)
+            for f in os.listdir(
+                Path(DEFAULT_JSON_EXPORT_DIR) / "/".join(reversed(lang.split()))
+            )
             if f.split(".json")[0] in (specific_tables or data_types)
         ]
         for lang in languages
@@ -103,13 +84,28 @@ def data_to_sqlite(
         cols : list of str
             The names of columns for the new table.
         """
-        # Convert column names to snake_case if requested.
-        cols = [
-            camel_to_snake(col) if identifier_case == "snake" else col for col in cols
-        ]
+        # Convert column names to snake_case if requested and ensure uniqueness
+        processed_cols = []
+        seen_cols = set()
+
+        for col in cols:
+            # Convert to snake_case if requested
+            col_name = camel_to_snake(col) if identifier_case == "snake" else col
+            # Use lowercase for duplicate checking
+            col_lower = col_name.lower()
+
+            if col_lower in seen_cols:
+                counter = 1
+                while f"{col_lower}_{counter}" in seen_cols:
+                    counter += 1
+                col_name = f"{col_name}_{counter}"
+                col_lower = f"{col_lower}_{counter}"
+
+            seen_cols.add(col_lower)
+            processed_cols.append(col_name)
 
         cursor.execute(
-            f"CREATE TABLE IF NOT EXISTS {data_type} ({' Text, '.join(cols)} Text, unique({cols[0]}))"
+            f"CREATE TABLE IF NOT EXISTS {data_type} ({' Text, '.join(processed_cols)} Text, unique({processed_cols[0]}))"
         )
 
     def table_insert(data_type, keys):
@@ -159,17 +155,26 @@ def data_to_sqlite(
         with open(json_file_path, "r", encoding="utf-8") as f:
             json_data = json.load(f)
 
-        target_cols = [
-            get_language_iso(language)
-            for language in current_languages
-            if language != lang
-        ]
-        cols = ["word"] + target_cols
+        # Define columns: lexeme_id, lastModified, word, and language columns
+        target_cols = [get_language_iso(language) for language in current_languages]
+        cols = ["lexeme_id", "lastModified", "word"] + target_cols
+
         create_table(data_type=lang, cols=cols)
         cursor.execute(f"DELETE FROM {lang}")  # clear existing data
-        for row in json_data:
-            keys = [row]
-            keys += [json_data[row][col_name] for col_name in cols[1:]]
+
+        for lexeme_id, entry in json_data.items():
+            word = next(key for key in entry.keys() if key != "lastModified")
+            translations = entry[word]
+
+            keys = [
+                lexeme_id,
+                entry["lastModified"],
+                word,
+            ]
+            # Add translations for each target language
+            for target_lang in target_cols:
+                keys.append(translations.get(target_lang))
+
             table_insert(data_type=lang, keys=keys)
 
         try:
@@ -222,7 +227,11 @@ def data_to_sqlite(
                 with open(json_file_path, "r", encoding="utf-8") as f:
                     json_data = json.load(f)
 
-                if dt in ["nouns", "verbs", "prepositions"]:
+                if dt in [
+                    key
+                    for key in data_type_metadata.keys()
+                    if key not in ["translations", "autosuggestions"]
+                ]:
                     cols = ["wdLexemeId"]
 
                     all_elem_keys = [
